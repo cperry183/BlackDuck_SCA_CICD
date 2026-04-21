@@ -1,0 +1,49 @@
+# detect-config.yml
+# Default Detect property overrides bundled in the container image.
+# Consumer pipelines can override any of these via CI/CD variables
+# which are passed as --flag arguments in entrypoint.sh.
+#
+# Reference: https://community.synopsys.com/s/document-item?bundleId=integrations-detect
+
+detect:
+  # --- Output ---
+  output:
+    path: /tmp/blackduck/output
+  scan:
+    output:
+      path: /tmp/blackduck/scan
+
+  # --- Reports ---
+  risk:
+    report:
+      pdf: true
+  notices:
+    report: true
+
+  # --- Signature scanner ---
+  blackduck:
+    signature:
+      scanner:
+        # Limit scanner memory to avoid OOM in constrained runners
+        memory: 4096
+        # Snippet matching off by default (slow); enable via BD_SNIPPET_MATCHING=true
+        snippet:
+          matching: false
+        # Upload source for accurate snippet detection when enabled
+        upload:
+          source:
+            mode: true
+
+  # --- Detectors ---
+  # Let Detect auto-detect; override with BD_DETECTORS if needed
+  # included:
+  #   detector:
+  #     types: GRADLE,NPM,MAVEN
+
+  # --- Cleanup ---
+  # Keep output for artifact upload
+  cleanup: false
+
+  # --- Logging ---
+  phone:
+    home: false  # disable telemetry in enterprise environments

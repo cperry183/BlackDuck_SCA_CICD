@@ -1,0 +1,4 @@
+# scripts/requirements.txt
+# Runtime dependencies bundled in the Docker image via pip
+requests>=2.31.0
+packaging>=23.0

@@ -1,0 +1,12 @@
+# requirements-dev.txt
+# Install with: pip install -r requirements-dev.txt
+-r scripts/requirements.txt
+
+# Testing
+pytest>=8.0
+pytest-mock>=3.12
+
+# Linting
+flake8>=7.0
+black>=24.0
+isort>=5.13

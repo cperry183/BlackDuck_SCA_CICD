@@ -1,0 +1,120 @@
+# gitlab/blackduck-scan.yml
+# =============================================================================
+# Reusable GitLab CI Component — Black Duck SCA Scan
+#
+# Include this file from your project pipeline:
+#
+#   include:
+#     - project: 'security/blackduck-cicd'
+#       ref: main
+#       file: 'gitlab/blackduck-scan.yml'
+#
+# Then extend the .blackduck_scan job in your own pipeline.
+# =============================================================================
+
+# --------------------------------------------------------------------------
+# Hidden base job (extend this)
+# --------------------------------------------------------------------------
+.blackduck_scan:
+  stage: scan
+  image:
+    name: "${BD_DETECT_IMAGE}"
+    entrypoint: [""]   # override so GitLab doesn't pass sh -c
+
+  # ---------- variables (all overrideable per project) ----------
+  variables:
+    # Required — must be set at group/project level:
+    #   BD_URL, BD_TOKEN, BD_DETECT_IMAGE
+
+    # Project identity — set per-job or inherit from group defaults
+    BD_PROJECT_NAME: "${CI_PROJECT_NAME}"
+    BD_PROJECT_VERSION: "${CI_COMMIT_REF_SLUG}"
+
+    # Policy gate
+    BD_POLICY_FAIL_ON_SEVERITIES: "CRITICAL,HIGH"
+    # BD_MAX_CVSS: "8.5"
+
+    # Scanner behavior
+    BD_TRUST_CERT: "false"
+    BD_SNIPPET_MATCHING: "false"
+    BD_GENERATE_SBOM: "true"
+    # BD_DETECTORS: "GRADLE,NPM"
+
+    # Source path inside the container (default = checked-out repo)
+    BD_SOURCE_PATH: "${CI_PROJECT_DIR}"
+
+    # Notifications (optional — set at group level)
+    # SLACK_WEBHOOK_URL: (masked variable)
+    # JIRA_URL, JIRA_TOKEN, JIRA_PROJECT_KEY
+
+    # GitLab-native: don't fetch entire git history (faster)
+    GIT_DEPTH: "1"
+
+  # ---------- run the scan ----------
+  script:
+    - /opt/blackduck/entrypoint.sh
+
+  # ---------- artifacts ----------
+  artifacts:
+    name: "blackduck-${CI_PROJECT_NAME}-${CI_COMMIT_SHORT_SHA}"
+    when: always
+    expire_in: 30 days
+    paths:
+      - "${CI_PROJECT_DIR}/blackduck-output/**"
+    reports:
+      # If you parse the risk report JSON into a GL-compatible format:
+      # dependency_scanning: blackduck-output/gl-dependency-scanning-report.json
+
+  # ---------- caching ----------
+  cache:
+    key: "blackduck-detect-jar-${DETECT_VERSION}"
+    paths:
+      - /opt/blackduck/detect/download/
+    policy: pull-push
+
+  # ---------- execution rules ----------
+  rules:
+    # Run on MRs targeting default branch
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Run on pushes to protected branches
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+    # Manual trigger from any branch
+    - if: '$BD_FORCE_SCAN == "true"'
+    # Skip if explicitly disabled
+    - if: '$BD_SKIP_SCAN == "true"'
+      when: never
+
+  # ---------- allow failure behavior ----------
+  # Change to true if you want informational-only scans during onboarding
+  allow_failure: false
+
+  # ---------- resource limits ----------
+  timeout: 45 minutes
+
+  tags:
+    - docker     # require Docker-capable runner
+
+
+# --------------------------------------------------------------------------
+# Variant: non-blocking (informational) scan
+# Use during onboarding to surface findings without breaking the pipeline
+# --------------------------------------------------------------------------
+.blackduck_scan_informational:
+  extends: .blackduck_scan
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+
+# --------------------------------------------------------------------------
+# Variant: scheduled full scan (weekly deep scan with snippet matching)
+# --------------------------------------------------------------------------
+.blackduck_scan_scheduled:
+  extends: .blackduck_scan
+  variables:
+    BD_SNIPPET_MATCHING: "true"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  timeout: 90 minutes

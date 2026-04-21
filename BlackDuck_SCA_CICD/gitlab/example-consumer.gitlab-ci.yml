@@ -1,0 +1,70 @@
+# example-consumer.gitlab-ci.yml
+# =============================================================================
+# Example: how a consuming project includes and configures the BlackDuck scan.
+# Copy to your project root as .gitlab-ci.yml and adjust as needed.
+# =============================================================================
+
+include:
+  - project: 'security/blackduck-cicd'
+    ref: v1.2.0                         # pin to a release tag
+    file: 'gitlab/blackduck-scan.yml'
+
+# ---------------------------------------------------------------------------
+stages:
+  - build
+  - test
+  - scan
+  - deploy
+
+# ---------------------------------------------------------------------------
+build:
+  stage: build
+  image: gradle:8-jdk17
+  script:
+    - gradle assemble
+  artifacts:
+    paths:
+      - build/libs/
+
+unit-tests:
+  stage: test
+  image: gradle:8-jdk17
+  script:
+    - gradle test
+
+# ---------------------------------------------------------------------------
+# Standard policy-gated scan on MRs and default branch
+# ---------------------------------------------------------------------------
+blackduck-sca:
+  extends: .blackduck_scan
+  stage: scan
+  variables:
+    BD_PROJECT_NAME: "my-awesome-app"
+    BD_PROJECT_VERSION: "${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+    BD_POLICY_FAIL_ON_SEVERITIES: "CRITICAL,HIGH"
+    BD_MAX_CVSS: "8.0"
+    # Only scan Gradle and NPM detectors — skip Docker, etc.
+    BD_DETECTORS: "GRADLE,NPM"
+
+
+# ---------------------------------------------------------------------------
+# Weekly scheduled deep scan (snippet matching, all detectors)
+# Configure a GitLab CI schedule for this pipeline to trigger it
+# ---------------------------------------------------------------------------
+blackduck-deep-scan:
+  extends: .blackduck_scan_scheduled
+  stage: scan
+  variables:
+    BD_PROJECT_NAME: "my-awesome-app"
+    BD_PROJECT_VERSION: "weekly-${CI_COMMIT_SHORT_SHA}"
+    BD_SNIPPET_MATCHING: "true"
+
+
+# ---------------------------------------------------------------------------
+deploy:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Deploy only runs when scan passes"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
