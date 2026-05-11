@@ -1,234 +1,255 @@
 #!/usr/bin/env python3
 """
-policy_gate.py — Black Duck SCA Policy Gate
+policy_gate.py — BlackDuck SCA Policy Enforcement
 
-Queries the Black Duck Hub REST API for the BOM component vulnerability
-summary of a given project/version and exits non-zero if the configured
-severity or CVSS thresholds are breached.
+Parses the Black Duck risk report JSON produced by Synopsys Detect and
+evaluates it against configurable severity and CVSS thresholds.
 
 Exit codes:
-    0  — all policies passed
-    1  — policy violation (pipeline should fail)
-    2  — configuration / API error
+    0  — All checks passed; no violations found.
+    1  — Policy violation: one or more vulns exceeded configured thresholds.
+    2  — Infrastructure / configuration error (missing report, bad JSON, etc.)
 """
 
+from __future__ import annotations
+
 import argparse
+import glob
 import json
 import logging
+import os
 import sys
-from typing import Optional
+from dataclasses import dataclass, field
+from pathlib import Path
 
-import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-
+# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
     level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger(__name__)
 
-SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+# ── Data classes ───────────────────────────────────────────────────────────────
+@dataclass
+class Violation:
+    cve_id: str
+    severity: str
+    cvss_score: float
+    component: str
+    component_version: str
+    reason: str  # "severity" | "cvss"
+
+    def to_dict(self) -> dict:
+        return {
+            "cve_id":            self.cve_id,
+            "severity":          self.severity,
+            "cvss_score":        self.cvss_score,
+            "component":         self.component,
+            "component_version": self.component_version,
+            "reason":            self.reason,
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"{self.cve_id} | {self.severity} | CVSS={self.cvss_score:.1f} | "
+            f"{self.component}@{self.component_version} | reason={self.reason}"
+        )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Black Duck SCA policy gate")
-    parser.add_argument("--bd-url", required=True)
-    parser.add_argument("--bd-token", required=True)
-    parser.add_argument("--project", required=True)
-    parser.add_argument("--version", required=True)
+@dataclass
+class PolicyResult:
+    passed: bool
+    violations: list[Violation] = field(default_factory=list)
+    total_scanned: int = 0
+
+# ── Report loading ─────────────────────────────────────────────────────────────
+def find_report(report_dir: str) -> Path:
+    """
+    Locate the Black Duck risk report JSON.
+    Detect writes it as:  <report_dir>/BlackDuck_RiskReport_*.json
+    Falls back to a recursive glob for resilience across Detect versions.
+    """
+    report_dir_path = Path(report_dir)
+    if not report_dir_path.is_dir():
+        log.error("Report directory does not exist: %s", report_dir)
+        sys.exit(2)
+
+    # Primary pattern (Detect ≥8)
+    candidates = sorted(report_dir_path.glob("BlackDuck_RiskReport_*.json"))
+    if not candidates:
+        # Fallback: recursive scan
+        candidates = sorted(report_dir_path.rglob("*risk*report*.json"))
+    if not candidates:
+        log.error(
+            "No risk report JSON found under '%s'. "
+            "Ensure Detect completed successfully and REPORT_DIR is correct.",
+            report_dir,
+        )
+        sys.exit(2)
+
+    if len(candidates) > 1:
+        log.warning(
+            "Multiple report files found — using the most recent: %s",
+            candidates[-1],
+        )
+    return candidates[-1]
+
+
+def load_report(report_path: Path) -> dict:
+    log.info("Loading report: %s", report_path)
+    try:
+        with report_path.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as exc:
+        log.error("Report JSON is malformed: %s", exc)
+        sys.exit(2)
+    except OSError as exc:
+        log.error("Cannot read report file: %s", exc)
+        sys.exit(2)
+
+# ── Evaluation ─────────────────────────────────────────────────────────────────
+def evaluate(
+    report: dict,
+    fail_severities: set[str],
+    max_cvss: float | None,
+) -> PolicyResult:
+    """
+    Walk every vulnerability in the report and collect those that breach
+    the configured severity list or CVSS ceiling.
+
+    The report structure (Detect ≥8) looks like:
+    {
+      "securityRiskProfile": { "counts": { ... } },
+      "items": [
+        {
+          "vulnerabilityWithRemediation": {
+            "vulnerabilityName": "CVE-2023-XXXX",
+            "severity": "CRITICAL",
+            "overallScore": 9.8,
+            "componentName": "log4j",
+            "componentVersionName": "2.14.1"
+          }
+        }, ...
+      ]
+    }
+    Older versions may embed vulns differently; we handle both shapes.
+    """
+    raw_items: list[dict] = report.get("items", [])
+    violations: list[Violation] = []
+    total = 0
+
+    for item in raw_items:
+        # Support both flat and nested vuln shapes
+        vuln = item.get("vulnerabilityWithRemediation") or item
+        cve_id          = vuln.get("vulnerabilityName") or vuln.get("id", "UNKNOWN")
+        severity        = (vuln.get("severity") or vuln.get("vulnerabilitySeverity", "")).upper()
+        cvss_score      = float(vuln.get("overallScore") or vuln.get("cvssScore", 0.0))
+        component       = vuln.get("componentName") or item.get("componentName", "unknown")
+        component_ver   = vuln.get("componentVersionName") or item.get("componentVersionName", "unknown")
+        total += 1
+
+        # Severity check
+        if fail_severities and severity in fail_severities:
+            violations.append(Violation(
+                cve_id=cve_id,
+                severity=severity,
+                cvss_score=cvss_score,
+                component=component,
+                component_version=component_ver,
+                reason="severity",
+            ))
+            continue  # don't double-count
+
+        # CVSS threshold check (strict greater-than, not >=, to match common policy wording)
+        if max_cvss is not None and cvss_score > max_cvss:
+            violations.append(Violation(
+                cve_id=cve_id,
+                severity=severity,
+                cvss_score=cvss_score,
+                component=component,
+                component_version=component_ver,
+                reason="cvss",
+            ))
+
+    return PolicyResult(
+        passed=len(violations) == 0,
+        violations=violations,
+        total_scanned=total,
+    )
+
+# ── Output helpers ─────────────────────────────────────────────────────────────
+def write_violations_json(violations: list[Violation], output_path: str) -> None:
+    payload = {"violation_count": len(violations), "violations": [v.to_dict() for v in violations]}
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    log.info("Violations JSON written to: %s", output_path)
+
+
+def print_summary(result: PolicyResult, fail_severities: set[str], max_cvss: float | None) -> None:
+    log.info("─" * 60)
+    log.info("Policy Gate Summary")
+    log.info("  Severities that fail : %s", ", ".join(sorted(fail_severities)) or "(none)")
+    log.info("  Max CVSS threshold   : %s", f">{max_cvss}" if max_cvss is not None else "(none)")
+    log.info("  Total vulns scanned  : %d", result.total_scanned)
+    log.info("  Violations found     : %d", len(result.violations))
+    log.info("─" * 60)
+    if result.violations:
+        log.error("POLICY GATE FAILED — violations:")
+        for v in result.violations:
+            log.error("  ✗ %s", v)
+    else:
+        log.info("POLICY GATE PASSED — no violations.")
+    log.info("─" * 60)
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate Black Duck scan results against policy thresholds.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--report-dir",
+        required=True,
+        help="Directory containing the Black Duck risk report JSON.",
+    )
     parser.add_argument(
         "--fail-on-severities",
-        default="CRITICAL",
-        help="Comma-separated list of severities that trigger failure (e.g. CRITICAL,HIGH)",
+        default="CRITICAL,HIGH",
+        help="Comma-separated list of severities that trigger a gate failure.",
     )
     parser.add_argument(
         "--max-cvss",
         type=float,
         default=None,
-        help="Fail if any vulnerability has CVSS score >= this value",
+        help="Gate fails when any vuln has a CVSS score strictly greater than this value.",
     )
     parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Disable TLS certificate verification",
+        "--violations-out",
+        default="",
+        help="Optional path to write a violations JSON file (consumed by notify/JIRA scripts).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def get_bearer_token(bd_url: str, api_token: str, verify: bool) -> str:
-    """Exchange the BD API token for a short-lived bearer token."""
-    resp = requests.post(
-        f"{bd_url}/api/tokens/authenticate",
-        headers={"Authorization": f"token {api_token}"},
-        verify=verify,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["bearerToken"]
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
 
-
-def find_project_version(
-    bd_url: str, headers: dict, project_name: str, version_name: str, verify: bool
-) -> Optional[str]:
-    """Return the href of the matching project version, or None."""
-    resp = requests.get(
-        f"{bd_url}/api/projects",
-        headers=headers,
-        params={"q": f"name:{project_name}", "limit": 10},
-        verify=verify,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    projects = resp.json().get("items", [])
-
-    for project in projects:
-        if project["name"] != project_name:
-            continue
-        versions_href = next(
-            (l["href"] for l in project["_meta"]["links"] if l["rel"] == "versions"),
-            None,
-        )
-        if not versions_href:
-            continue
-        vresp = requests.get(
-            versions_href,
-            headers=headers,
-            params={"q": f"versionName:{version_name}", "limit": 10},
-            verify=verify,
-            timeout=30,
-        )
-        vresp.raise_for_status()
-        for version in vresp.json().get("items", []):
-            if version["versionName"] == version_name:
-                return version["_meta"]["href"]
-
-    return None
-
-
-def get_vuln_summary(version_href: str, headers: dict, verify: bool) -> dict:
-    """Return the vulnerability counts and high-severity details."""
-    resp = requests.get(
-        f"{version_href}/vulnerable-bom-components",
-        headers=headers,
-        params={"limit": 500},
-        verify=verify,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    items = resp.json().get("items", [])
-
-    counts = {s: 0 for s in SEVERITY_ORDER}
-    max_cvss = 0.0
-    violations = []
-
-    for item in items:
-        for vuln in item.get("vulnerabilityWithRemediation", [{}]):
-            sev = vuln.get("severity", "INFO").upper()
-            cvss = vuln.get("overallScore", 0.0)
-            counts[sev] = counts.get(sev, 0) + 1
-            if cvss > max_cvss:
-                max_cvss = cvss
-            violations.append(
-                {
-                    "component": item.get("componentName", "?"),
-                    "version": item.get("componentVersionName", "?"),
-                    "vuln_id": vuln.get("vulnerabilityName", "?"),
-                    "severity": sev,
-                    "cvss": cvss,
-                    "remediation": vuln.get("remediationStatus", "NEW"),
-                }
-            )
-
-    return {"counts": counts, "max_cvss": max_cvss, "violations": violations}
-
-
-def main() -> int:
-    args = parse_args()
-    fail_severities = [s.strip().upper() for s in args.fail_on_severities.split(",")]
-    verify = not args.insecure
-
-    if args.insecure:
-        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-        log.warning("TLS verification disabled")
-
-    log.info("Authenticating with Black Duck Hub...")
-    try:
-        token = get_bearer_token(args.bd_url, args.bd_token, verify)
-    except requests.HTTPError as exc:
-        log.error("Authentication failed: %s", exc)
-        return 2
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.blackducksoftware.bill-of-materials-6+json",
+    fail_severities: set[str] = {
+        s.strip().upper() for s in args.fail_on_severities.split(",") if s.strip()
     }
 
-    log.info("Locating project '%s' version '%s'...", args.project, args.version)
-    version_href = find_project_version(
-        args.bd_url, headers, args.project, args.version, verify
-    )
-    if not version_href:
-        log.error(
-            "Project '%s' / version '%s' not found in Black Duck Hub.",
-            args.project,
-            args.version,
-        )
-        return 2
+    report_path = find_report(args.report_dir)
+    report      = load_report(report_path)
+    result      = evaluate(report, fail_severities, args.max_cvss)
 
-    log.info("Fetching vulnerability summary...")
-    summary = get_vuln_summary(version_href, headers, verify)
-    counts = summary["counts"]
-    max_cvss = summary["max_cvss"]
+    print_summary(result, fail_severities, args.max_cvss)
 
-    log.info("--- Vulnerability Summary ---")
-    for sev in SEVERITY_ORDER:
-        log.info("  %-10s %d", sev, counts.get(sev, 0))
-    log.info("  Max CVSS   %.1f", max_cvss)
-    log.info("-----------------------------")
+    if args.violations_out:
+        write_violations_json(result.violations, args.violations_out)
 
-    # Evaluate policy
-    policy_failed = False
-    failure_reasons = []
-
-    for sev in fail_severities:
-        count = counts.get(sev, 0)
-        if count > 0:
-            reason = f"{count} {sev} vulnerability/vulnerabilities found"
-            failure_reasons.append(reason)
-            policy_failed = True
-
-    if args.max_cvss is not None and max_cvss >= args.max_cvss:
-        reason = f"Max CVSS {max_cvss:.1f} >= threshold {args.max_cvss:.1f}"
-        failure_reasons.append(reason)
-        policy_failed = True
-
-    if policy_failed:
-        log.error("POLICY GATE FAILED:")
-        for r in failure_reasons:
-            log.error("  • %s", r)
-
-        # Print top violating components
-        critical_high = [
-            v for v in summary["violations"] if v["severity"] in ("CRITICAL", "HIGH")
-        ]
-        critical_high.sort(key=lambda x: x["cvss"], reverse=True)
-        if critical_high:
-            log.error("Top violations:")
-            for v in critical_high[:10]:
-                log.error(
-                    "  [%s %.1f] %s@%s — %s (%s)",
-                    v["severity"],
-                    v["cvss"],
-                    v["component"],
-                    v["version"],
-                    v["vuln_id"],
-                    v["remediation"],
-                )
-        return 1
-
-    log.info("✓ POLICY GATE PASSED — no violations above threshold.")
-    return 0
+    return 0 if result.passed else 1
 
 
 if __name__ == "__main__":
